@@ -17,6 +17,8 @@
 
 # %%
 import json, os, pathlib, sys
+import hashlib
+from datetime import datetime, timezone
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 
@@ -25,6 +27,13 @@ from labkit.config import get_tier
 
 ROOT = pathlib.Path.cwd() if (pathlib.Path.cwd() / "data").exists() else pathlib.Path.cwd().parent
 TIER = get_tier(os.environ.get("COMPUTE_TIER", "T4"))
+if (ROOT / "results" / "runs.csv").exists() or any((ROOT / "adapters").glob("*/adapter_config.json")):
+    raise RuntimeError("Đã có artefact train: không được đo lại baseline sau khi train trong cùng thí nghiệm.")
+
+eval_checksums = {
+    name: hashlib.sha256((ROOT / "data" / name).read_bytes()).hexdigest()
+    for name in ("eval_target.jsonl", "eval_regression.jsonl")
+}
 
 def load_jsonl(p):
     return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()]
@@ -73,8 +82,15 @@ def score_run(model, tok, system_prompt, label):
     return scores, preds, rpreds
 
 
-scores_a, preds_a, _ = score_run(model, tok, generate.NAIVE_PROMPT, "(a) base + naive prompt")
+scores_a, preds_a, rpreds_a = score_run(model, tok, generate.NAIVE_PROMPT, "(a) base + naive prompt")
 scores_b, preds_b, rpreds_b = score_run(model, tok, generate.OPTIMIZED_PROMPT, "(b) base + optimized prompt")
+report.write_json({
+    "model": TIER.model_id,
+    "target_inputs": [r["input"] for r in target],
+    "regression_inputs": [r["instruction"] for r in regression],
+    "baseline_a": {"target": preds_a, "regression": rpreds_a},
+    "baseline_b": {"target": preds_b, "regression": rpreds_b},
+}, "baseline_predictions.json", results_dir=ROOT / "results")
 
 # %% [markdown]
 # ## 3. Đóng băng
@@ -84,6 +100,9 @@ scores_b, preds_b, rpreds_b = score_run(model, tok, generate.OPTIMIZED_PROMPT, "
 
 # %%
 frozen = {
+    "frozen_at_utc": datetime.now(timezone.utc).isoformat(),
+    "eval_checksums": eval_checksums,
+    "optimized_prompt": generate.OPTIMIZED_PROMPT,
     "tier": TIER.name,
     "model": TIER.model_id,
     "baseline_a": scores_a.as_dict(),
@@ -97,6 +116,8 @@ frozen = {
 }
 report.write_json(frozen, "baselines_frozen.json", results_dir=ROOT / "results")
 print(json.dumps(frozen, ensure_ascii=False, indent=2))
+if scores_b.target <= scores_a.target:
+    raise RuntimeError("Baseline (b) chưa thắng (a). Dừng trước train; cải thiện prompt (b) rồi đo lại NB2.")
 
 # %% [markdown]
 # ### Đọc kết quả trước khi đi tiếp

@@ -32,7 +32,10 @@ def check(name: str, status: str, detail: str = "") -> None:
 
 
 def _sha(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    # Shipped corpus references use LF; Git may check out CRLF on Windows.
+    # NB2 freeze checks below still compare exact raw bytes independently.
+    content = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(content).hexdigest()[:16]
 
 
 def _load_json(path: pathlib.Path):
@@ -155,11 +158,10 @@ def full() -> None:
             from labkit.generate import OPTIMIZED_PROMPT
             expected = hashlib.sha256(OPTIMIZED_PROMPT.encode()).hexdigest()[:16]
             same = frozen.get("optimized_prompt_sha") == expected
-            check("baseline (b) prompt unmodified", OK if same else WARN,
+            check("baseline (b) prompt unmodified", OK if same else FAIL,
                   "" if same else
-                  "OPTIMIZED_PROMPT differs from the shipped one. That is allowed only if "
-                  "you made it STRONGER — say so in REPORT.md; weakening it to flatter the "
-                  "fine-tune is the main way to fail this lab's honesty check.")
+                  "OPTIMIZED_PROMPT differs from the prompt frozen by NB2. "
+                  "Improve it and rerun NB2 BEFORE training; do not change it afterward.")
         except Exception as exc:
             check("baseline (b) prompt check", WARN, repr(exc))
 
@@ -167,13 +169,19 @@ def full() -> None:
         b = frozen.get("baseline_b", {}).get("target")
         if a is not None and b is not None:
             if b <= a:
-                check("baseline (b) beats (a)", WARN,
+                check("baseline (b) beats (a)", FAIL,
                       f"(b)={b:.3f} <= (a)={a:.3f} — your 'optimized' prompt is not "
                       "actually better. Improve it before claiming a fine-tune win.")
             else:
                 check("baseline (b) beats (a)", OK, f"(a)={a:.3f} -> (b)={b:.3f}")
 
     # --- eval set untouched ---
+    if frozen and frozen.get("eval_checksums"):
+        drift = [name for name in ("eval_target.jsonl", "eval_regression.jsonl")
+                 if not (ROOT / "data" / name).exists()
+                 or hashlib.sha256((ROOT / "data" / name).read_bytes()).hexdigest()
+                 != frozen["eval_checksums"].get(name)]
+        check("eval sets match NB2 freeze", FAIL if drift else OK, str(drift) if drift else "")
     declared = (ROOT / "data" / "CUSTOM_DATASET.md").exists()
     ref = _load_json(ROOT / "data" / "checksums.json")
     if ref:

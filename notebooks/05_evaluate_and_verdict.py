@@ -12,6 +12,7 @@
 
 # %%
 import json, os, pathlib, sys
+import hashlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 
@@ -33,6 +34,11 @@ if EVAL_LIMIT:
     target, regression = target[:EVAL_LIMIT], regression[:EVAL_LIMIT]
 
 frozen = json.loads((ROOT / "results" / "baselines_frozen.json").read_text(encoding="utf-8"))
+assert TIER.model_id == frozen["model"], "Base model differs from NB2"
+assert hashlib.sha256(generate.OPTIMIZED_PROMPT.encode()).hexdigest()[:16] == frozen["optimized_prompt_sha"], "Prompt differs from NB2"
+for name, expected in frozen["eval_checksums"].items():
+    assert hashlib.sha256((ROOT / "data" / name).read_bytes()).hexdigest() == expected, "Eval differs from NB2"
+assert len(regression) == frozen["n_regression"], "Regression eval slice differs from NB2"
 base_b = ev.GroupScores(**{k: v for k, v in frozen["baseline_b"].items() if k != "extra"})
 base_a = ev.GroupScores(**{k: v for k, v in frozen["baseline_a"].items() if k != "extra"})
 
@@ -95,6 +101,8 @@ def score_adapter(adapter_dir: pathlib.Path, system_prompt: str | None, *,
 scores_ft, preds_ft, rpreds_ft = score_adapter(ROOT / "adapters" / "correct",
                                                generate.NAIVE_PROMPT)
 print("fine-tune:", scores_ft.as_dict())
+report.write_json({"model": TIER.model_id, "target": preds_ft, "regression": rpreds_ft},
+                  "correct_predictions.json", results_dir=ROOT / "results")
 
 # %% [markdown]
 # ## 2. Bảng so sánh ba baseline
@@ -161,9 +169,11 @@ for key in CONTRAST_KEYS:
     if not adir.exists():
         print(f"skip {key}: {adir} chưa có — chạy NB4 trước")
         continue
-    s_k, _, _ = score_adapter(adir, generate.NAIVE_PROMPT,
+    s_k, preds_k, _ = score_adapter(adir, generate.NAIVE_PROMPT,
                               load_in_4bit=SPECS[key].load_in_4bit,
                               with_regression=False, label=key)
+    report.write_json({"model": TIER.model_id, "target": preds_k},
+                      f"{key}_predictions.json", results_dir=ROOT / "results")
     autopsy.append({"run": key, "target": round(s_k.target, 4),
                     "format": round(s_k.format, 4),
                     "latency_ms": round(s_k.latency_ms, 1), "n": s_k.n})
@@ -172,6 +182,8 @@ for key in CONTRAST_KEYS:
 print()
 print(report.markdown_table(autopsy, ["run", "target", "format", "latency_ms", "n"]))
 report.write_json(autopsy, "autopsy.json", results_dir=ROOT / "results")
+report.write_json(sorted(autopsy, key=lambda r: r["target"], reverse=True),
+                  "target_ranking.json", results_dir=ROOT / "results")
 
 # %% [markdown]
 # ### Bảng này mới là câu trả lời cho ba câu hỏi ở cuối NB4
@@ -187,16 +199,35 @@ report.write_json(autopsy, "autopsy.json", results_dir=ROOT / "results")
 
 # %%
 rows = []
+baseline_predictions = json.loads((ROOT / "results/baseline_predictions.json").read_text(encoding="utf-8"))
+assert baseline_predictions["target_inputs"][:len(target)] == [r["input"] for r in target]
+preds_b = baseline_predictions["baseline_b"]["target"][:len(target)]
 for i, (p, r) in enumerate(zip(preds_ft, target)):
     s_ft = ev.triage_field_accuracy(p, r["label"])
-    rows.append({"i": i, "ticket": r["input"][:70], "ft_score": round(s_ft, 2),
-                 "ft_pred": p.replace("\n", " ")[:90]})
+    s_b = ev.triage_field_accuracy(preds_b[i], r["label"])
+    rows.append({"i": i, "ticket": r["input"], "label": r["label"],
+                 "ft_score": s_ft, "baseline_b_score": s_b,
+                 "delta": s_ft - s_b,
+                 "outcome": "loss" if s_ft < s_b else "win" if s_ft > s_b else "tie",
+                 "baseline_b_pred": preds_b[i], "ft_pred": p})
 rows.sort(key=lambda x: x["ft_score"])
 print("--- 3 ca TỆ NHẤT (bắt buộc đưa vào report) ---")
 print(report.markdown_table(rows[:3], ["i", "ticket", "ft_score", "ft_pred"]))
 print("\n--- 3 ca TỐT NHẤT ---")
 print(report.markdown_table(rows[-3:], ["i", "ticket", "ft_score", "ft_pred"]))
 report.write_json(rows, "qualitative.json", results_dir=ROOT / "results")
+losses = sorted([r for r in rows if r["outcome"] == "loss"], key=lambda r: r["delta"])
+wins = sorted([r for r in rows if r["outcome"] == "win"], key=lambda r: r["delta"], reverse=True)
+selected = losses[:2] + wins[:2]
+for r in rows:
+    if len(selected) >= 5:
+        break
+    if r["i"] not in {s["i"] for s in selected}:
+        selected.append(r)
+report.write_json({"examples": selected, "n_losses": len(losses), "n_wins": len(wins),
+                   "at_least_two_real_losses": len(losses) >= 2,
+                   "note": "If fewer than two losses exist, report that honestly; do not fabricate cases."},
+                  "qualitative_selected.json", results_dir=ROOT / "results")
 
 # %% [markdown]
 # ## ✅ Checkpoint NB5

@@ -29,6 +29,7 @@
 
 # %%
 import json, os, pathlib, sys, time
+import hashlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 
@@ -38,6 +39,18 @@ from labkit.config import SPECS, get_tier, training_epochs
 ROOT = pathlib.Path.cwd() if (pathlib.Path.cwd() / "data").exists() else pathlib.Path.cwd().parent
 TIER = get_tier(os.environ.get("COMPUTE_TIER", "T4"))
 SPEC = SPECS["correct"]
+frozen = json.loads((ROOT / "results/baselines_frozen.json").read_text(encoding="utf-8"))
+proof = json.loads((ROOT / "results/mask_proof.json").read_text(encoding="utf-8"))
+assert frozen["model"] == TIER.model_id == proof["model_id"], "Model must match NB1 and NB2"
+assert not frozen["smoke_mode"], "Run NB2 on the full eval sets before training"
+assert frozen["baseline_b"]["target"] > frozen["baseline_a"]["target"], "Improve baseline (b) before training"
+assert hashlib.sha256(generate.OPTIMIZED_PROMPT.encode()).hexdigest()[:16] == frozen["optimized_prompt_sha"], "Frozen prompt changed"
+for name, expected in frozen["eval_checksums"].items():
+    assert hashlib.sha256((ROOT / "data" / name).read_bytes()).hexdigest() == expected, "Frozen eval changed"
+assert proof["answer_is_supervised"] and proof["question_is_masked"] and proof["supervised_fraction"] < 0.95
+assert os.environ.get("MASK_MODE", "assistant-only") == proof["mask_mode"], "Mask mode must match NB1 proof"
+assert SPEC.alpha == 2 * SPEC.r and TIER.effective_batch < 32
+assert not (ROOT / "adapters/correct/adapter_config.json").exists(), "Adapter already exists; save it before starting a new run"
 print(f"{TIER.name} · {TIER.model_id} · {SPEC.label}")
 print(device.banner())      # which precision is ACTUALLY being used, and why
 
@@ -49,7 +62,9 @@ print(device.banner())      # which precision is ACTUALLY being used, and why
 
 # %%
 model, tok = generate.load_base(TIER, load_in_4bit=SPEC.load_in_4bit)
-print(json.dumps(modeling.layer_type_summary(model.config), ensure_ascii=False, indent=2))
+layer_summary = modeling.layer_type_summary(model.config)
+print(json.dumps(layer_summary, ensure_ascii=False, indent=2))
+report.write_json(layer_summary, "layer_types.json", results_dir=ROOT / "results")
 
 # %% [markdown]
 # ## 2. `all-linear` — nhưng không phải *mọi* linear
@@ -83,6 +98,10 @@ def load_jsonl(p):
 
 train_rows = load_jsonl(split_dir / "train.jsonl")
 MASK_MODE = os.environ.get("MASK_MODE", "assistant-only")
+seed_sample = load_jsonl(ROOT / "data/train_seed.jsonl")[0]
+checked = data.build_example(tok, data.to_messages(seed_sample), max_length=TIER.max_length, mask_mode=MASK_MODE)
+assert checked.n_supervised == proof["n_supervised"] and checked.n_total == proof["n_total"], "Tokenizer mask differs from NB1"
+assert data.decode_supervised(tok, checked)[:300] == proof["supervised_preview"], "Supervised span differs from NB1"
 
 # Train on the mask you PROVED in NB1 — not on a library flag.
 #
@@ -99,7 +118,7 @@ sup = sum(sum(1 for x in r["labels"] if x != data.IGNORE_INDEX) for r in rows)
 tot = sum(len(r["labels"]) for r in rows)
 print(train_ds)
 print(f"mask_mode = {MASK_MODE}   supervised {sup}/{tot} tokens ({sup/tot:.1%})")
-assert 0 < sup < tot, "mask covers nothing or everything — stop and re-run NB1"
+assert 0 < sup / tot < 0.95, "mask covers nothing or nearly everything — stop and re-run NB1"
 
 # %% [markdown]
 # ## 4. Cấu hình — lọc theo phiên bản TRL đang cài
@@ -143,6 +162,9 @@ trainer = SFTTrainer(
     processing_class=tok,          # NOT tokenizer= — removed in TRL v1
     peft_config=LoraConfig(**lora_kwargs),
 )
+assert len(trainer.train_dataset) == len(rows), "Trainer changed the pre-tokenized dataset"
+for index, expected in enumerate(rows):
+    assert trainer.train_dataset[index]["labels"] == expected["labels"], "Trainer changed the proved loss mask"
 
 # TRL casts LoRA weights to bf16 regardless of the device or the fp16 flag it was
 # handed. fp16's GradScaler cannot unscale bf16 gradients -- see F-23 and
@@ -165,6 +187,7 @@ out = ROOT / "adapters" / SPEC.key
 trainer.model.save_pretrained(out)
 tok.save_pretrained(out)
 print("saved ->", out)
+assert result.global_step == STEPS, "Actual training step budget differs from planned steps"
 
 row = train.summarize_run(SPEC, TIER, targets, trainable, elapsed, generate.peak_vram_gb())
 row["final_loss"] = round(result.training_loss, 4)
@@ -172,6 +195,10 @@ row["mask_mode"] = MASK_MODE
 # Record the step budget so NB5/verify can CHECK that the four runs are comparable,
 # instead of trusting that they were configured the same way.
 row["max_steps"] = STEPS
+row["actual_steps"] = result.global_step
+row["epochs"] = EPOCHS
+row["max_length"] = TIER.max_length
+row["nb2_frozen_at_utc"] = frozen["frozen_at_utc"]
 report.append_row(row, results_dir=ROOT / "results")
 print(json.dumps(row, ensure_ascii=False, indent=2))
 

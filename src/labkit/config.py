@@ -55,7 +55,7 @@ TIERS: dict[str, Tier] = {
         name="T4",
         model_id="unsloth/Qwen3.5-4B",
         vram_gb_bf16_lora=10.0,
-        max_length=1024,
+        max_length=256,  # NB1: p95=98, max=101 on the 250-ticket seed corpus.
         per_device_batch=1,
         grad_accum=16,
         notes="Free Colab T4 (16 GB) — the default path for this lab.",
@@ -179,7 +179,13 @@ product   = tên sản phẩm xuất hiện nguyên văn trong ticket
 
 Ví dụ:
 Ticket: "Shop ơi, mình đặt bàn phím cơ mã đơn DH123456. Giao hàng chậm. Đã 3 ngày rồi. Nhờ shop kiểm tra."
-JSON: {"intent": "van_chuyen", "urgency": "trung_binh", "product": "bàn phím cơ", "sentiment": "trung_tinh"}"""
+JSON: {"intent": "van_chuyen", "urgency": "trung_binh", "product": "bàn phím cơ", "sentiment": "trung_tinh"}
+
+Ticket: "Xin chào, mình đặt nồi chiên không dầu mã đơn DH906826. Không hoạt động. Không vội. Nhờ shop kiểm tra."
+JSON: {"intent": "san_pham_loi", "urgency": "thap", "product": "nồi chiên không dầu", "sentiment": "trung_tinh"}
+
+Ticket: "Alo shop, mình đặt balo laptop mã đơn VN411453. Cho tôi trả lại. Đã 3 ngày rồi. Cho tôi hỏi."
+JSON: {"intent": "doi_tra", "urgency": "trung_binh", "product": "balo laptop", "sentiment": "trung_tinh"}"""
 
 
 CONTRAST_KEYS = ["attn_only", "wrong_lr", "qlora"]

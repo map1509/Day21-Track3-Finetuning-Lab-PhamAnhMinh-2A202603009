@@ -97,6 +97,8 @@ report.write_json(check, "template_check.json", results_dir=ROOT / "results")
 
 # %%
 sample = data.to_messages(train_raw[0])
+print("--- MẪU SAU apply_chat_template ---")
+print(tok.apply_chat_template(sample, tokenize=False, add_generation_prompt=False))
 
 for mode in ("assistant-only", "everything"):
     ex = data.build_example(tok, sample, max_length=TIER.max_length, mask_mode=mode)
@@ -104,7 +106,7 @@ for mode in ("assistant-only", "everything"):
     print(f"mode = {mode}   supervised {ex.n_supervised}/{ex.n_total} "
           f"({ex.supervised_fraction:.0%})")
     print("--- LOSS TÍNH TRÊN ĐOẠN NÀY ---")
-    print(data.decode_supervised(tok, ex)[:400])
+    print(data.decode_supervised(tok, ex))
 
 # %% [markdown]
 # **Dừng lại và đọc kỹ output ở trên.**
@@ -124,10 +126,11 @@ ex = data.build_example(tok, sample, max_length=TIER.max_length, mask_mode="assi
 supervised = data.decode_supervised(tok, ex)
 masked = data.decode_masked(tok, ex)
 
-answer = sample[-1]["content"][:40]
+answer = sample[-1]["content"]
 question_fragment = train_raw[0]["input"][:40]
 
 proof = {
+    "model_id": TIER.model_id,
     "mask_mode": "assistant-only",
     "n_supervised": ex.n_supervised,
     "n_total": ex.n_total,
@@ -139,6 +142,7 @@ proof = {
 }
 assert proof["answer_is_supervised"], "câu trả lời KHÔNG nằm trong loss — mask sai"
 assert proof["question_is_masked"], "câu hỏi ĐANG nằm trong loss — mask sai"
+assert ex.supervised_fraction < 0.95, "loss đang bao phủ gần như toàn bộ prompt"
 print(json.dumps({k: v for k, v in proof.items() if not k.endswith("preview")},
                  ensure_ascii=False, indent=2))
 report.write_json(proof, "mask_proof.json", results_dir=ROOT / "results")

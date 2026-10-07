@@ -22,6 +22,7 @@
 
 # %%
 import json, os, pathlib, sys, time
+import hashlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 
@@ -30,6 +31,17 @@ from labkit.config import CONTRAST_KEYS, SPECS, get_tier, training_epochs
 
 ROOT = pathlib.Path.cwd() if (pathlib.Path.cwd() / "data").exists() else pathlib.Path.cwd().parent
 TIER = get_tier(os.environ.get("COMPUTE_TIER", "T4"))
+correct_rows = [r for r in report.read_rows(results_dir=ROOT / "results") if r.get("run") == "correct"]
+assert correct_rows, "Import NB3 runs.csv before NB4"
+correct_row = correct_rows[-1]
+frozen = json.loads((ROOT / "results/baselines_frozen.json").read_text(encoding="utf-8"))
+assert correct_row["model"] == frozen["model"] == TIER.model_id
+assert hashlib.sha256(generate.OPTIMIZED_PROMPT.encode()).hexdigest()[:16] == frozen["optimized_prompt_sha"]
+for name, expected in frozen["eval_checksums"].items():
+    assert hashlib.sha256((ROOT / "data" / name).read_bytes()).hexdigest() == expected
+assert os.environ.get("MASK_MODE", "assistant-only") == correct_row["mask_mode"]
+assert TIER.max_length == int(correct_row["max_length"])
+assert training_epochs() == float(correct_row["epochs"])
 
 from datasets import Dataset
 
@@ -80,9 +92,14 @@ def run_contrast(key: str) -> dict:
         print(f"  matched rank for {key}: r={r} (alpha={spec.alpha})")
 
     trainable = modeling.count_lora_params(model, targets, spec.r)
+    budget_error = abs(trainable / int(correct_row["trainable_params"]) - 1)
+    if key == "attn_only":
+        assert budget_error < 0.05, "attention-only parameter budget differs by >=5%"
+        print(f"  parameter budget difference: {budget_error:.2%}")
     # Same step budget as NB3's `correct`, derived from the same recipe rather than
     # hardcoded -- one variable per contrast means the step count is NOT a variable.
     max_steps = train.planned_steps(len(train_ds), TIER, training_epochs())
+    assert max_steps == int(correct_row["actual_steps"]) == int(correct_row["max_steps"]), "Step budget differs from correct"
     want = train.sft_config_kwargs(TIER, spec, str(ROOT / "adapters" / key),
                                    max_steps=max_steps)
     sft_kwargs, _ = train.filter_kwargs(SFTConfig, want, label=f"SFTConfig[{key}]")
@@ -92,6 +109,9 @@ def run_contrast(key: str) -> dict:
     trainer = SFTTrainer(model=model, args=SFTConfig(**sft_kwargs),
                          train_dataset=train_ds, processing_class=tok,
                          peft_config=LoraConfig(**lora_kwargs))
+    assert len(trainer.train_dataset) == len(train_ds)
+    for index in range(len(train_ds)):
+        assert trainer.train_dataset[index]["labels"] == train_ds[index]["labels"], "Trainer changed the pre-tokenized mask"
     # Without this the `qlora` run dies at step 0: TRL hands back bf16 LoRA weights and
     # fp16's GradScaler has no BFloat16 kernel. See F-23 / scripts/probe_precision.py.
     fix = train.align_trainable_precision(trainer.model)
@@ -105,10 +125,17 @@ def run_contrast(key: str) -> dict:
 
     out = ROOT / "adapters" / key
     trainer.model.save_pretrained(out)
+    assert res.global_step == max_steps, "Actual step count differs from correct"
+    report.write_json(trainer.state.log_history, f"{key}_training_log.json", results_dir=ROOT / "results")
 
     row = train.summarize_run(spec, TIER, targets, trainable, elapsed, generate.peak_vram_gb())
     row["final_loss"] = round(res.training_loss, 4)
     row["max_steps"] = max_steps
+    row["actual_steps"] = res.global_step
+    row["mask_mode"] = correct_row["mask_mode"]
+    row["max_length"] = TIER.max_length
+    row["epochs"] = training_epochs()
+    row["parameter_budget_error"] = round(budget_error, 6)
     row["teaches"] = spec.teaches
     report.append_row(row, results_dir=ROOT / "results")
 
@@ -124,14 +151,16 @@ def run_contrast(key: str) -> dict:
 # An adapter directory that already exists is treated as done. Set FORCE_RETRAIN=1 to
 # retrain everything, and delete `adapters/<key>/` to redo just one.
 FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN", "").lower() in {"1", "true", "yes"}
-ONLY = [k for k in os.environ.get("ONLY", "").split(",") if k.strip()]
+ONLY = [k.strip() for k in os.environ.get("ONLY", "").split(",") if k.strip()]
 
 rows = []
 for key in (ONLY or CONTRAST_KEYS):
-    if key not in SPECS:
+    if key not in CONTRAST_KEYS:
         raise SystemExit(f"unknown run {key!r}; expected some of {CONTRAST_KEYS}")
     done = (ROOT / "adapters" / key / "adapter_model.safetensors").exists()
-    if done and not FORCE_RETRAIN:
+    saved_rows = [r for r in report.read_rows(results_dir=ROOT / "results") if r.get("run") == key]
+    if done and saved_rows and not FORCE_RETRAIN:
+        assert int(saved_rows[-1]["max_steps"]) == int(correct_row["max_steps"])
         print(f"skip {key}: adapters/{key}/ already trained "
               f"(FORCE_RETRAIN=1 to redo, or delete the directory)")
         continue
